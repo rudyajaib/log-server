@@ -49,7 +49,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	limit := intParam(r, "limit", 0, 0, 100000)
-	entries, matched := s.buf.Query(filter, limit, 0)
+	entries, matched := s.buf.Query(oslog.Query{Filter: filter, Limit: limit})
 	status := s.status()
 	target := strings.TrimSpace(status.Target.Name)
 

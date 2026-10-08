@@ -100,13 +100,17 @@
     <p class="empty-title">No log entries</p>
     <p class="empty-sub">Choose a source above and press <strong>Start capture</strong>.</p>
   </div>
+  <button id="load-older" class="load-older" hidden>↑ Load older entries</button>
   <button id="jump-latest" class="jump" hidden>Jump to latest ↓</button>
 </main>
 
 <footer class="bottombar">
   <div class="counts">
-    <span id="visible-count">0 shown</span>
+    <span id="visible-count">0 loaded</span>
     <span id="match-count" class="muted"></span>
+    <span id="buffer-note" class="muted"></span>
+    <span id="history-note" class="muted"></span>
+    <button id="history-clear" class="link-btn" hidden title="Empty the history file and resume recording">clear history</button>
     <span id="drop-note" class="warn" hidden></span>
   </div>
   <div class="exports">

@@ -3,6 +3,7 @@
 package oslog
 
 import (
+	"bytes"
 	"encoding/json"
 	"path"
 	"strings"
@@ -60,11 +61,29 @@ type Entry struct {
 	TraceID     uint64    `json:"traceId,omitempty"`
 	Signpost    *Signpost `json:"signpost,omitempty"`
 	Source      string    `json:"source,omitempty"`
+
+	// search is the lowercased concatenation of the searchable fields, built once
+	// when the entry is stored. Filter scans run over the whole buffer repeatedly
+	// (facet polls, status polls, snapshots), and re-deriving this for every entry
+	// on every scan dominated the cost of those scans. Unexported so it is neither
+	// serialised nor part of the API.
+	search string
 }
 
-// ParseEvent decodes one ndjson line. It reports false for blank lines and for
-// the human readable notices `log stream` writes to stdout (for example
-// `Filtering the log data using "..."`), which must be ignored.
+// searchable is the text a free-text query is matched against.
+func (e Entry) searchable() string {
+	return e.Message + " " + e.Subsystem + " " + e.Category + " " + e.Process + " " + e.Level
+}
+
+// BuildSearch prepares the cached lowercase haystack. It is called when an entry
+// enters the buffer and when one is loaded back from history.
+func (e *Entry) BuildSearch() {
+	e.search = strings.ToLower(e.searchable())
+}
+
+// ParseEvent decodes one ndjson line from `log stream`. It reports false for
+// blank lines and for the human readable notices `log stream` writes to stdout
+// (for example `Filtering the log data using "..."`), which must be ignored.
 func ParseEvent(line []byte, source string) (Entry, bool) {
 	trimmed := strings.TrimSpace(string(line))
 	if len(trimmed) == 0 || trimmed[0] != '{' {
@@ -75,6 +94,21 @@ func ParseEvent(line []byte, source string) (Entry, bool) {
 		return Entry{}, false
 	}
 	return ev.toEntry(source), true
+}
+
+// DecodeEntry decodes an Entry that was previously serialised, which is how the
+// on-disk history is stored.
+func DecodeEntry(line []byte) (Entry, bool) {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return Entry{}, false
+	}
+	var e Entry
+	if err := json.Unmarshal(trimmed, &e); err != nil {
+		return Entry{}, false
+	}
+	e.BuildSearch()
+	return e, true
 }
 
 func (ev Event) toEntry(source string) Entry {

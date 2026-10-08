@@ -1,6 +1,9 @@
 package oslog
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Facet is a distinct value seen in the log stream together with how many
 // matching entries carry it. It powers the subsystem/category pickers.
@@ -54,6 +57,7 @@ func (b *Buffer) Add(e Entry) Entry {
 }
 
 func (b *Buffer) addLocked(e Entry) Entry {
+	e.BuildSearch()
 	e.ID = b.nextID
 	b.nextID++
 	b.total++
@@ -102,33 +106,86 @@ func (b *Buffer) snapshotLocked(afterID uint64) []Entry {
 	return out
 }
 
-// Query returns the buffered entries that match the filter, considering only
-// entries with an ID greater than afterID. When limit is positive, the most
-// recent limit matches are returned, oldest first. The second return value is
-// the number of matches before the limit was applied, so callers can tell
-// whether the result was truncated.
-func (b *Buffer) Query(f Filter, limit int, afterID uint64) ([]Entry, int) {
+// Query describes a request for buffered entries.
+type Query struct {
+	Filter Filter
+	// Limit caps how many entries come back; 0 means no limit.
+	Limit int
+	// After is an exclusive lower ID bound, used when resuming a stream.
+	After uint64
+	// Before is an exclusive upper ID bound, used when paging backwards.
+	Before uint64
+}
+
+// Query returns matching entries ordered oldest first, together with the total
+// number of matches inside the bounds before Limit was applied. When Limit is
+// positive the newest matches are kept, which is what a log view wants.
+func (b *Buffer) Query(q Query) ([]Entry, int) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	entries, matched, _ := b.queryLocked(q)
+	return entries, matched
+}
 
+// Snapshot returns the entries for a new subscriber together with the facets
+// computed at the same instant, so the filter counts and the rows a viewer
+// receives can never disagree.
+func (b *Buffer) Snapshot(f Filter, limit int, afterID uint64) ([]Entry, int, ScopedFacets) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	entries, matched, facets := b.queryLocked(Query{Filter: f, Limit: limit, After: afterID})
+	facets.Matched = b.countLocked(f)
+	facets.Total = b.total
+	facets.Buffered = b.count
+	facets.Capacity = len(b.entries)
+	facets.Evicted = b.evicted
+	return entries, matched, facets
+}
+
+// queryLocked walks the ring once, keeping a sliding window of the newest Limit
+// matches so a wide filter never materialises the whole buffer.
+func (b *Buffer) queryLocked(q Query) ([]Entry, int, ScopedFacets) {
+	limit := q.Limit
+	window := []Entry{} // never nil, so it marshals as [] rather than null
+	next := 0
 	matched := 0
-	capacity := b.count
-	if limit > 0 && limit < capacity {
-		capacity = limit
+
+	add := func(e Entry) {
+		if limit <= 0 {
+			window = append(window, e)
+			return
+		}
+		if len(window) < limit {
+			window = append(window, e)
+			return
+		}
+		window[next] = e
+		next = (next + 1) % limit
 	}
-	out := make([]Entry, 0, capacity)
+
 	for i := 0; i < b.count; i++ {
 		e := b.entries[(b.head+i)%len(b.entries)]
-		if e.ID <= afterID || !f.Match(e) {
+		if e.ID <= q.After {
+			continue
+		}
+		if q.Before > 0 && e.ID >= q.Before {
+			continue
+		}
+		if !q.Filter.Match(e) {
 			continue
 		}
 		matched++
-		out = append(out, e)
+		add(e)
 	}
-	if limit > 0 && len(out) > limit {
-		out = out[len(out)-limit:]
+
+	if limit > 0 && next > 0 {
+		// Rotate the ring so the entries read oldest first.
+		rotated := make([]Entry, 0, len(window))
+		rotated = append(rotated, window[next:]...)
+		rotated = append(rotated, window[:next]...)
+		window = rotated
 	}
-	return out, matched
+	return window, matched, b.scopedFacetsLocked(q.Filter, 500)
 }
 
 func (b *Buffer) countLocked(f Filter) int {
@@ -149,32 +206,113 @@ func (b *Buffer) countLocked(f Filter) int {
 func (b *Buffer) ScopedFacets(f Filter, limit int) ScopedFacets {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
+	out := b.scopedFacetsLocked(f, limit)
+	out.Matched = b.countLocked(f)
+	out.Total = b.total
+	out.Buffered = b.count
+	out.Capacity = len(b.entries)
+	out.Evicted = b.evicted
+	return out
+}
 
-	return ScopedFacets{
-		Subsystems: b.facetLocked(f.WithoutDimension("subsystem"), limit, func(e Entry) string { return e.Subsystem }),
-		Categories: b.facetLocked(f.WithoutDimension("category"), limit, func(e Entry) string { return e.Category }),
-		Processes:  b.facetLocked(f.WithoutDimension("process"), limit, func(e Entry) string { return e.Process }),
-		Levels:     b.facetLocked(f.WithoutDimension("level"), limit, func(e Entry) string { return e.Level }),
-		Matched:    b.countLocked(f),
-		Total:      b.total,
-		Buffered:   b.count,
-		Capacity:   len(b.entries),
-		Evicted:    b.evicted,
+// dimensionIndex identifies a facet dimension.
+const (
+	dimSubsystem = iota
+	dimCategory
+	dimProcess
+	dimLevel
+	dimCount
+)
+
+func dimensionValue(e Entry, dim int) string {
+	switch dim {
+	case dimSubsystem:
+		return e.Subsystem
+	case dimCategory:
+		return e.Category
+	case dimProcess:
+		return e.Process
+	default:
+		return e.Level
 	}
 }
 
-func (b *Buffer) facetLocked(f Filter, limit int, value func(Entry) string) []Facet {
-	counts := map[string]int{}
+// scopedFacetsLocked builds every facet list in a single pass. The filter is
+// evaluated once per entry into a dimensionMatch, and each relaxed view is then
+// just a conjunction of the flags that are already known. Doing four independent
+// passes over the whole buffer was measurably the most expensive thing the server
+// did, and it held the buffer lock that ingest needs.
+func (b *Buffer) scopedFacetsLocked(f Filter, limit int) ScopedFacets {
+	var counts [dimCount]map[string]int
+	matched := 0
+
+	add := func(dim int, value string) {
+		if value == "" {
+			return
+		}
+		if counts[dim] == nil {
+			counts[dim] = make(map[string]int)
+		}
+		counts[dim][value]++
+	}
+
 	for i := 0; i < b.count; i++ {
 		e := b.entries[(b.head+i)%len(b.entries)]
-		if !f.Match(e) {
+		m := f.matches(e)
+
+		if m.subsystem && m.category && m.process && m.level && m.text && m.hasSubsystem {
+			matched++
+			// Matching the full filter means matching every relaxed variant too.
+			for dim := 0; dim < dimCount; dim++ {
+				add(dim, dimensionValue(e, dim))
+			}
 			continue
 		}
-		if v := value(e); v != "" {
-			counts[v]++
+		if !m.text {
+			// The text restriction applies to every dimension, so this entry is in
+			// none of the lists.
+			continue
+		}
+		if m.category && m.process && m.level && m.hasSubsystem {
+			add(dimSubsystem, e.Subsystem)
+		}
+		if m.subsystem && m.process && m.level && m.hasSubsystem {
+			add(dimCategory, e.Category)
+		}
+		if m.subsystem && m.category && m.level && m.hasSubsystem {
+			add(dimProcess, e.Process)
+		}
+		if m.subsystem && m.category && m.process && m.hasSubsystem {
+			add(dimLevel, e.Level)
 		}
 	}
-	return topFacets(counts, limit)
+
+	return ScopedFacets{
+		Subsystems: topFacets(counts[dimSubsystem], limit),
+		Categories: topFacets(counts[dimCategory], limit),
+		Processes:  topFacets(counts[dimProcess], limit),
+		Levels:     topFacets(counts[dimLevel], limit),
+		Matched:    matched,
+	}
+}
+
+// Count returns how many buffered entries match the filter. It is the cheap path
+// for callers that need the number but not the facet lists.
+func (b *Buffer) Count(f Filter) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.countLocked(f)
+}
+
+// TimeSpan reports the timestamps of the oldest and newest buffered entries, so
+// callers can tell viewers how much wall clock time the buffer currently covers.
+func (b *Buffer) TimeSpan() (oldest, newest time.Time, ok bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.count == 0 {
+		return time.Time{}, time.Time{}, false
+	}
+	return b.entries[b.head].Timestamp, b.entries[(b.head+b.count-1)%len(b.entries)].Timestamp, true
 }
 
 // Len reports how many entries are currently buffered.

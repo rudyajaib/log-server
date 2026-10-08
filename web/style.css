@@ -316,6 +316,35 @@ mark { background: rgba(245,181,68,.35); color: #fff; border-radius: 2px; }
   box-shadow: 0 8px 24px rgba(0,0,0,.45);
 }
 
+.load-older {
+  position: absolute;
+  left: 50%;
+  top: 34px;
+  transform: translateX(-50%);
+  border-radius: 999px;
+  background: var(--bg-elev-2);
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.4);
+}
+.load-older:disabled { opacity: .6; }
+
+.logwrap.updating::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: sweep 1s linear infinite;
+}
+@keyframes sweep {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
+}
+
 /* ------------------------------------------------------------ bottombar -- */
 
 .bottombar {

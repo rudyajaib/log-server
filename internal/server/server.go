@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rudy/log-server/internal/history"
 	"github.com/rudy/log-server/internal/oslog"
 )
 
@@ -24,19 +25,26 @@ type Options struct {
 	WebFS      fs.FS
 	BufferSize int
 	Logger     *log.Logger
+	// History persists captured entries to disk. Optional: when nil, only the
+	// in-memory buffer is available.
+	History *history.Store
 }
 
 // Status is the payload sent to clients describing the current capture.
 type Status struct {
 	oslog.Status
-	Total        uint64  `json:"total"`
-	Buffered     int     `json:"buffered"`
-	Capacity     int     `json:"capacity"`
-	Evicted      uint64  `json:"evicted"`
-	Rate         float64 `json:"rate"`
-	Clients      int     `json:"clients"`
-	Admin        bool    `json:"admin"`
-	DeviceNotice string  `json:"deviceNotice,omitempty"`
+	Total        uint64        `json:"total"`
+	Buffered     int           `json:"buffered"`
+	Capacity     int           `json:"capacity"`
+	Evicted      uint64        `json:"evicted"`
+	BufferFrom   string        `json:"bufferFrom,omitempty"`
+	BufferTo     string        `json:"bufferTo,omitempty"`
+	Rate         float64       `json:"rate"`
+	Clients      int           `json:"clients"`
+	Matched      int           `json:"matched"`
+	Admin        bool          `json:"admin"`
+	DeviceNotice string        `json:"deviceNotice,omitempty"`
+	History      history.Stats `json:"history"`
 }
 
 // Server implements http.Handler.
@@ -55,7 +63,16 @@ type Server struct {
 	rate            float64
 	lastSampleTotal uint64
 	lastSampleAt    time.Time
+
+	facetsMu  sync.Mutex
+	facetsKey string
+	facetsAt  time.Time
+	facets    oslog.ScopedFacets
 }
+
+// facetCacheTTL bounds how often the whole-buffer facet scan can run for a given
+// filter, no matter how many viewers are polling.
+const facetCacheTTL = 1200 * time.Millisecond
 
 // New creates a server. Call Close to release resources.
 func New(opts Options) *Server {
@@ -103,6 +120,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/stream", s.handleSSE)
 	mux.HandleFunc("GET /api/export", s.handleExport)
 	mux.HandleFunc("POST /api/buffer/clear", s.handleClear)
+	mux.HandleFunc("POST /api/history/clear", s.handleHistoryClear)
 	mux.HandleFunc("POST /api/simulators/boot", s.handleBoot)
 	mux.Handle("GET /", s.web)
 	return s.withCORS(mux)
@@ -188,8 +206,14 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	// Starting a new capture replaces the previous one.
 	streamer.Stop()
 
-	// A new capture starts a fresh buffer so counts and facets match the session.
+	// A new capture starts a fresh buffer so counts and facets match the session,
+	// and a fresh history file so scrolling back stays inside that session.
 	s.buf.Clear()
+	if s.opts.History != nil {
+		if err := s.opts.History.Restart(); err != nil {
+			s.logger.Printf("resetting history: %v", err)
+		}
+	}
 	s.mu.Lock()
 	s.rate = 0
 	s.lastSampleTotal = 0
@@ -229,13 +253,27 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEntry(e oslog.Entry) {
 	stored := s.buf.Add(e)
+	if s.opts.History != nil {
+		if err := s.opts.History.Append(stored); err != nil {
+			s.logger.Printf("history append failed: %v", err)
+		}
+	}
 	s.hub.publish(stored)
 }
 
 // ---------------------------------------------------------------- queries --
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.status())
+	status := s.status()
+	// A caller may pass a filter so the match count describes the view it is
+	// showing. Only the count is needed, so this takes the cheap single-pass path
+	// rather than building the facet lists as well.
+	if len(r.URL.Query()) > 0 {
+		if filter, err := oslog.NewFilter(r.URL.Query()); err == nil {
+			status.Matched = s.buf.Count(filter)
+		}
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleFacets(w http.ResponseWriter, r *http.Request) {
@@ -245,7 +283,34 @@ func (s *Server) handleFacets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := intParam(r, "limit", 500, 1, 5000)
-	writeJSON(w, http.StatusOK, s.buf.ScopedFacets(filter, limit))
+	writeJSON(w, http.StatusOK, s.cachedFacets(r, filter, limit))
+}
+
+// cachedFacets serves the periodic facet polls from a short lived cache. Several
+// open viewers (and each viewer's own timer) would otherwise recompute the same
+// four lists over the whole buffer, and every recomputation holds the buffer lock
+// that ingest needs.
+func (s *Server) cachedFacets(r *http.Request, filter oslog.Filter, limit int) oslog.ScopedFacets {
+	key := r.URL.RawQuery
+	now := time.Now()
+
+	s.facetsMu.Lock()
+	if s.facetsKey == key && now.Sub(s.facetsAt) < facetCacheTTL {
+		cached := s.facets
+		s.facetsMu.Unlock()
+		cached.Total = s.buf.Total()
+		cached.Buffered = s.buf.Len()
+		cached.Evicted = s.buf.Evicted()
+		return cached
+	}
+	s.facetsMu.Unlock()
+
+	result := s.buf.ScopedFacets(filter, limit)
+
+	s.facetsMu.Lock()
+	s.facetsKey, s.facetsAt, s.facets = key, time.Now(), result
+	s.facetsMu.Unlock()
+	return result
 }
 
 type logsResponse struct {
@@ -253,26 +318,81 @@ type logsResponse struct {
 	Matched   int           `json:"matched"`
 	Returned  int           `json:"returned"`
 	Truncated bool          `json:"truncated"`
+	HasMore   bool          `json:"hasMore"`
+	Source    string        `json:"source"`
 	LastID    uint64        `json:"lastId"`
 }
 
+// handleLogs pages through matching entries. Paging backwards with `before`
+// walks the in-memory buffer first and then continues into the on-disk history,
+// which is what lets a viewer scroll back past the buffer into entries that were
+// evicted minutes ago.
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	filter, err := oslog.NewFilter(r.URL.Query())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	limit := intParam(r, "limit", 1000, 1, 5000)
+	limit := intParam(r, "limit", 1000, 1, 20000)
 	after := uint64Param(r, "after", 0)
+	before := uint64Param(r, "before", 0)
+	useHistory := !strings.EqualFold(r.URL.Query().Get("scope"), "buffer")
 
-	entries, matched := s.buf.Query(filter, limit, after)
+	entries, matched := s.buf.Query(oslog.Query{Filter: filter, Limit: limit, After: after, Before: before})
+	source := "buffer"
+	if len(entries) == 0 {
+		source = ""
+	}
+	hasMore := matched > len(entries)
+
+	if useHistory && !hasMore && s.opts.History != nil && len(entries) < limit {
+		oldest := before
+		if len(entries) > 0 {
+			oldest = entries[0].ID
+		}
+		older, more, err := s.opts.History.Query(filter, limit-len(entries), oldest)
+		if err != nil {
+			s.logger.Printf("history query failed: %v", err)
+		} else if len(older) > 0 {
+			entries = append(older, entries...)
+			switch source {
+			case "buffer":
+				source = "buffer+history"
+			case "":
+				source = "history"
+			}
+			hasMore = more
+		}
+	}
+	if source == "" {
+		source = "empty"
+	}
+
 	writeJSON(w, http.StatusOK, logsResponse{
 		Entries:   entries,
 		Matched:   matched,
 		Returned:  len(entries),
 		Truncated: matched > len(entries),
+		HasMore:   hasMore,
+		Source:    source,
 		LastID:    s.buf.LastID(),
 	})
+}
+
+func (s *Server) handleHistoryClear(w http.ResponseWriter, r *http.Request) {
+	if err := requireJSON(r); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.opts.History == nil {
+		writeError(w, http.StatusNotFound, "history is disabled")
+		return
+	}
+	if err := s.opts.History.Restart(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.opts.History.Stats())
 }
 
 func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +488,7 @@ func (s *Server) status() Status {
 }
 
 func (s *Server) buildStatus(st oslog.Status, rate float64) Status {
-	return Status{
+	out := Status{
 		Status:       st,
 		Total:        s.buf.Total(),
 		Buffered:     s.buf.Len(),
@@ -379,6 +499,14 @@ func (s *Server) buildStatus(st oslog.Status, rate float64) Status {
 		Admin:        isAdmin(),
 		DeviceNotice: deviceNotice(),
 	}
+	if oldest, newest, ok := s.buf.TimeSpan(); ok {
+		out.BufferFrom = oldest.Format(time.RFC3339Nano)
+		out.BufferTo = newest.Format(time.RFC3339Nano)
+	}
+	if s.opts.History != nil {
+		out.History = s.opts.History.Stats()
+	}
+	return out
 }
 
 func isAdmin() bool { return os.Geteuid() == 0 }

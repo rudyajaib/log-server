@@ -82,7 +82,7 @@ func TestBufferQueryLimitsAndCountsMatches(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries, matched := b.Query(filter, 3, 0)
+	entries, matched := b.Query(Query{Filter: filter, Limit: 3})
 	if matched != 5 {
 		t.Errorf("matched = %d, want 5", matched)
 	}
@@ -94,10 +94,27 @@ func TestBufferQueryLimitsAndCountsMatches(t *testing.T) {
 		t.Errorf("returned IDs %d..%d, want 5..9", entries[0].ID, entries[2].ID)
 	}
 
-	after, matchedAfter := b.Query(filter, 0, 5)
+	after, matchedAfter := b.Query(Query{Filter: filter, After: 5})
 	if len(after) != 2 || matchedAfter != 2 {
 		t.Errorf("Query(after=5) returned %d entries (%d matched), want 2 and 2", len(after), matchedAfter)
 	}
+
+	// Backward paging: the two matches immediately older than ID 7.
+	older, olderMatched := b.Query(Query{Filter: filter, Limit: 2, Before: 7})
+	if olderMatched != 3 {
+		t.Errorf("backward match count = %d, want 3 (IDs 1,3,5)", olderMatched)
+	}
+	if len(older) != 2 || older[1].ID != 5 {
+		t.Errorf("backward page = %v, want the newest two matches under ID 7 ending at 5", ids(older))
+	}
+}
+
+func ids(entries []Entry) []uint64 {
+	out := make([]uint64, len(entries))
+	for i, e := range entries {
+		out[i] = e.ID
+	}
+	return out
 }
 
 func TestBufferScopedFacetsAreCascading(t *testing.T) {

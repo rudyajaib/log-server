@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	clientQueueSize    = 4096
-	flushInterval      = 120 * time.Millisecond
+	clientQueueSize    = 16384
+	flushInterval      = 100 * time.Millisecond
 	keepAliveInterval  = 20 * time.Second
-	maxEntriesPerBatch = 500
+	maxEntriesPerBatch = 250
 )
 
 // message is a unit of work for a subscribed client.
@@ -94,12 +94,14 @@ func (h *hub) broadcastStatus(s Status) {
 }
 
 type snapshotPayload struct {
-	Mode      string        `json:"mode"` // full | resume
-	Entries   []oslog.Entry `json:"entries"`
-	Matched   int           `json:"matched"`
-	Truncated bool          `json:"truncated"`
-	Filter    oslog.Filter  `json:"filter"`
-	Status    Status        `json:"status"`
+	Mode      string             `json:"mode"` // full | resume
+	Entries   []oslog.Entry      `json:"entries"`
+	Matched   int                `json:"matched"`
+	Truncated bool               `json:"truncated"`
+	Older     bool               `json:"older"`
+	Facets    oslog.ScopedFacets `json:"facets"`
+	Filter    oslog.Filter       `json:"filter"`
+	Status    Status             `json:"status"`
 }
 
 // handleSSE streams log entries to the browser as Server-Sent Events.
@@ -140,7 +142,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer s.hub.unsubscribe(client)
 
 	mode := "full"
-	entries, matched := s.buf.Query(filter, snapshotLimit, resumeID)
+	entries, matched, facets := s.buf.Snapshot(filter, snapshotLimit, resumeID)
 	if resumeID > 0 {
 		mode = "resume"
 	}
@@ -150,11 +152,19 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			watermark = e.ID
 		}
 	}
+	// Older matching entries may live further back in the buffer, or on disk.
+	older := matched > len(entries)
+	if !older && s.opts.History != nil && s.opts.History.Stats().Entries > 0 {
+		older = true
+	}
+
 	s.writeEvent(w, "snapshot", strconv.FormatUint(watermark, 10), snapshotPayload{
 		Mode:      mode,
 		Entries:   entries,
 		Matched:   matched,
 		Truncated: matched > len(entries),
+		Older:     older,
+		Facets:    facets,
 		Filter:    filter,
 		Status:    s.status(),
 	})

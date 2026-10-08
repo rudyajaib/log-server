@@ -72,28 +72,67 @@ func NewFilter(values url.Values) (Filter, error) {
 
 // Match reports whether the entry satisfies every configured restriction.
 func (f Filter) Match(e Entry) bool {
-	if f.RequireSubsystem && e.Subsystem == "" {
-		return false
+	m := f.matches(e)
+	return m.subsystem && m.category && m.process && m.level && m.text && m.hasSubsystem
+}
+
+// dimensionMatch records which of the filter's restrictions an entry satisfies.
+// A single evaluation is enough to derive every relaxed view of the filter, which
+// is what lets one pass over the buffer produce all four facet lists plus the
+// match count instead of four separate passes.
+type dimensionMatch struct {
+	subsystem    bool
+	category     bool
+	process      bool
+	level        bool
+	text         bool
+	hasSubsystem bool
+}
+
+func (f Filter) matches(e Entry) dimensionMatch {
+	return dimensionMatch{
+		subsystem:    matchDimension(f.subsystemSet, f.Subsystems, e.Subsystem),
+		category:     matchDimension(f.categorySet, f.Categories, e.Category),
+		process:      matchDimension(f.processSet, f.Processes, e.Process),
+		level:        matchDimension(f.levelSet, f.Levels, e.Level),
+		text:         f.MatchText(e),
+		hasSubsystem: !f.RequireSubsystem || e.Subsystem != "",
 	}
-	if !matchDimension(f.subsystemSet, f.Subsystems, e.Subsystem) {
-		return false
-	}
-	if !matchDimension(f.categorySet, f.Categories, e.Category) {
-		return false
-	}
-	if !matchDimension(f.processSet, f.Processes, e.Process) {
-		return false
-	}
-	if !matchDimension(f.levelSet, f.Levels, e.Level) {
-		return false
-	}
+}
+
+// MatchText applies only the free text query. Each field is tested on its own so
+// that scanning a whole buffer does not allocate a combined string per entry.
+func (f Filter) MatchText(e Entry) bool {
 	if f.Query == "" {
 		return true
 	}
-	return f.matchesText(e.haystack())
+	if f.re != nil {
+		return f.re.MatchString(e.Message) || f.re.MatchString(e.Subsystem) ||
+			f.re.MatchString(e.Category) || f.re.MatchString(e.Process) || f.re.MatchString(e.Level)
+	}
+	if f.CaseSensitive {
+		for _, s := range [...]string{e.Message, e.Subsystem, e.Category, e.Process, e.Level} {
+			if s != "" && strings.Contains(s, f.needle) {
+				return true
+			}
+		}
+		return false
+	}
+	// Case-insensitive matching runs against the haystack prepared once at ingest;
+	// the fallback covers entries constructed directly (tests, history replay).
+	search := e.search
+	if search == "" {
+		search = strings.ToLower(e.searchable())
+	}
+	return strings.Contains(search, f.needle)
 }
 
-func (f Filter) matchesText(haystack string) bool {
+// MatchesText exposes free-text matching against an arbitrary string so the UI can
+// reuse the same rules.
+func (f Filter) MatchesText(haystack string) bool {
+	if f.Query == "" {
+		return true
+	}
 	if f.re != nil {
 		return f.re.MatchString(haystack)
 	}
@@ -101,14 +140,6 @@ func (f Filter) matchesText(haystack string) bool {
 		return strings.Contains(haystack, f.needle)
 	}
 	return strings.Contains(strings.ToLower(haystack), f.needle)
-}
-
-// MatchesText exposes free-text matching so the UI can reuse the same rules.
-func (f Filter) MatchesText(haystack string) bool {
-	if f.Query == "" {
-		return true
-	}
-	return f.matchesText(haystack)
 }
 
 // MatchAll reports whether no restriction at all is configured.
@@ -171,20 +202,9 @@ func (f Filter) Describe() string {
 	return strings.Join(parts, " ")
 }
 
-// haystack is the concatenation searched by the free text query.
+// haystack is the concatenation searched by the case-insensitive text query.
 func (e Entry) haystack() string {
-	var sb strings.Builder
-	sb.Grow(len(e.Message) + len(e.Subsystem) + len(e.Category) + len(e.Process) + 8)
-	sb.WriteString(e.Message)
-	sb.WriteByte(' ')
-	sb.WriteString(e.Subsystem)
-	sb.WriteByte(' ')
-	sb.WriteString(e.Category)
-	sb.WriteByte(' ')
-	sb.WriteString(e.Process)
-	sb.WriteByte(' ')
-	sb.WriteString(e.Level)
-	return sb.String()
+	return e.Message + " " + e.Subsystem + " " + e.Category + " " + e.Process + " " + e.Level
 }
 
 func matchDimension(set map[string]struct{}, patterns []string, value string) bool {

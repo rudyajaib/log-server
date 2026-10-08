@@ -8,11 +8,13 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	"github.com/rudy/log-server/internal/history"
 	"github.com/rudy/log-server/internal/oslog"
 )
 
@@ -133,6 +135,130 @@ func TestLogsEndpointFiltersAndLimits(t *testing.T) {
 	}
 	if payload.Returned != 2 || !payload.Truncated {
 		t.Errorf("Returned = %d, Truncated = %v; want 2 and true", payload.Returned, payload.Truncated)
+	}
+	if !payload.HasMore {
+		t.Error("HasMore = false, but older matches remain in the buffer")
+	}
+}
+
+// TestLogsPagesBackPastTheBuffer covers the reason the history file exists: a
+// rare entry that the buffer has already evicted must still be reachable.
+func TestLogsPagesBackPastTheBuffer(t *testing.T) {
+	dir := t.TempDir()
+	store, err := history.Open(filepath.Join(dir, "session.ndjson"), 0)
+	if err != nil {
+		t.Fatalf("opening history: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	s := New(Options{
+		WebFS:      fstest.MapFS{},
+		BufferSize: 20, // deliberately small so most entries are evicted
+		Logger:     log.New(io.Discard, "", 0),
+		History:    store,
+	})
+	t.Cleanup(s.Close)
+	handler := s.Handler()
+
+	// One rare entry, then enough noise to evict it from the buffer.
+	s.handleEntry(oslog.Entry{Subsystem: "centrifugo-websocket.futures.open-order", Message: "the rare one"})
+	for i := 0; i < 200; i++ {
+		s.handleEntry(oslog.Entry{Subsystem: "com.apple.network", Message: "noise"})
+	}
+	if got := s.buf.Len(); got != 20 {
+		t.Fatalf("buffer holds %d entries, want the 20 entry cap", got)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/api/logs?subsystem=centrifugo-websocket.futures.open-order", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, r)
+
+	var payload logsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decoding logs: %v", err)
+	}
+	if payload.Matched != 0 {
+		t.Errorf("the buffer should no longer match anything, got %d", payload.Matched)
+	}
+	if len(payload.Entries) != 1 || payload.Entries[0].Message != "the rare one" {
+		t.Fatalf("history paging returned %+v, want the evicted entry", payload.Entries)
+	}
+	// The buffer no longer holds it, so this page came purely from history.
+	if payload.Source != "history" {
+		t.Errorf("Source = %q, want history", payload.Source)
+	}
+}
+
+func TestSnapshotCarriesFacetsAndOlderFlag(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.Handler()
+
+	s.handleEntry(oslog.Entry{Subsystem: "com.a", Category: "net", Level: "Info", Message: "one"})
+	s.handleEntry(oslog.Entry{Subsystem: "com.b", Category: "db", Level: "Error", Message: "two"})
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/api/stream?subsystem=com.a")
+	if err != nil {
+		t.Fatalf("opening the stream: %v", err)
+	}
+	defer resp.Body.Close()
+
+	raw := nextEvent(t, readEvents(resp.Body), "snapshot")
+	var payload snapshotPayload
+	if idx := strings.Index(raw, "data="); idx >= 0 {
+		if err := json.Unmarshal([]byte(raw[idx+len("data="):]), &payload); err != nil {
+			t.Fatalf("decoding snapshot: %v\n%s", err, raw)
+		}
+	} else {
+		t.Fatalf("no data field in %s", raw)
+	}
+
+	if payload.Matched != 1 || len(payload.Entries) != 1 {
+		t.Errorf("matched %d with %d entries, want 1 and 1", payload.Matched, len(payload.Entries))
+	}
+	// The facets travel with the snapshot so counts and rows cannot disagree.
+	if len(payload.Facets.Categories) != 1 || payload.Facets.Categories[0].Value != "net" {
+		t.Errorf("facets categories = %+v, want just net", payload.Facets.Categories)
+	}
+	if len(payload.Facets.Subsystems) != 2 {
+		t.Errorf("facets subsystems = %+v, want both so the selection stays changeable", payload.Facets.Subsystems)
+	}
+	if payload.Older {
+		t.Error("Older = true, but nothing matches below the snapshot")
+	}
+}
+
+func TestLogsAndExportReturnArraysWhenEmpty(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.Handler()
+	s.handleEntry(oslog.Entry{Subsystem: "com.a", Message: "only entry"})
+
+	for _, path := range []string{
+		"/api/logs?subsystem=com.nothing",
+		"/api/export?format=json&subsystem=com.nothing",
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		body := rec.Body.String()
+		if strings.Contains(body, "null") {
+			t.Errorf("%s returned null instead of an empty array:\n%s", path, body)
+		}
+		if !strings.Contains(body, "[]") {
+			t.Errorf("%s did not return an empty array:\n%s", path, body)
+		}
+	}
+}
+
+func TestHistoryClearEndpoint(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.Handler()
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/history/clear", strings.NewReader("{}")))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 when history is disabled", rec.Code)
 	}
 }
 
