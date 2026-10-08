@@ -89,30 +89,6 @@ func TestFilterInvalidRegex(t *testing.T) {
 	}
 }
 
-func TestFilterWithoutDimension(t *testing.T) {
-	filter := mustFilter(t, map[string][]string{
-		"subsystem":    {"com.a"},
-		"category":     {"net"},
-		"q":            {"boom"},
-		"hasSubsystem": {"true"},
-	})
-	entry := Entry{Subsystem: "com.b", Category: "net", Message: "boom"}
-
-	if filter.Match(entry) {
-		t.Fatal("precondition: the subsystem restriction should reject this entry")
-	}
-	if !filter.WithoutDimension("subsystem").Match(entry) {
-		t.Error("dropping the subsystem dimension should let the entry through")
-	}
-	if filter.WithoutDimension("category").Match(entry) {
-		t.Error("dropping an unrelated dimension must not relax the subsystem filter")
-	}
-	// Query and the other dimensions must survive.
-	if !filter.WithoutDimension("subsystem").MatchesText(entry.haystack()) {
-		t.Error("the text query should be preserved")
-	}
-}
-
 func TestFilterMatchAll(t *testing.T) {
 	if !mustFilter(t, nil).MatchAll() {
 		t.Error("an empty filter should match everything")

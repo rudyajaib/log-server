@@ -24,7 +24,7 @@ const RENDER_EXTEND = 500;  // older rows revealed per scroll-back step
 const MAX_LIVE = 5000;      // rows kept in memory while following the live tail
 const HARD_MAX = 20000;     // absolute ceiling on loaded rows when paging history
 const PAGE_SIZE = 1000;     // entries fetched per "load older"
-const FACET_REFRESH_MS = 5000;
+const FACET_REFRESH_MS = 8000;
 const STATUS_REFRESH_MS = 2000;
 const TOP_TRIGGER = 120;
 
@@ -71,6 +71,9 @@ const state = {
     targetKey: '',
     level: 'default',
   },
+  scopeText: '',          // subsystem allowlist, applied when a capture starts
+  ignoreApple: false,     // capture options set in the modal
+  ignoreNoSubsystem: false,
 };
 
 const dom = {};
@@ -80,9 +83,13 @@ for (const id of [
   'banner', 'banner-text', 'banner-close', 'advanced-toggle', 'advanced-row', 'predicate',
   'subsystem-filter', 'category-filter', 'process-filter', 'level-filter',
   'query', 'regex-toggle', 'case-toggle', 'require-subsystem',
+  'capture-modal', 'capture-modal-sub', 'capture-modal-hint', 'capture-modal-summary',
+  'capture-modal-close', 'capture-modal-cancel', 'capture-modal-start',
+  'capture-subsystems', 'capture-use-selected', 'capture-clear-subsystems',
+  'capture-ignore-apple', 'capture-ignore-nosubsystem',
   'pause-toggle', 'autoscroll-toggle', 'sort-toggle', 'clear-view',
   'log-scroll', 'log-head', 'log-rows', 'empty-state', 'jump-latest', 'load-older',
-  'visible-count', 'match-count', 'buffer-note', 'history-note', 'history-clear', 'drop-note',
+  'visible-count', 'match-count', 'buffer-note', 'history-note', 'history-clear', 'drop-note', 'scope-note',
   'copy-json', 'copy-link', 'detail', 'detail-body', 'detail-copy', 'detail-close',
 ]) {
   dom[camel(id)] = document.getElementById(id);
@@ -116,6 +123,14 @@ function formatTime(iso) {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`;
 }
 
+// parseScope turns the scope textarea into the subsystem list sent on start.
+function parseScope(text) {
+  return text
+    .split(/[\n,]/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -130,6 +145,15 @@ function formatBytes(bytes) {
     unit++;
   }
   return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+function formatAgo(iso) {
+  if (!iso) return '';
+  const seconds = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (!Number.isFinite(seconds) || seconds < 0) return '';
+  if (seconds < 90) return 'now';
+  if (seconds < 5400) return `${Math.round(seconds / 60)}m ago`;
+  return `${Math.round(seconds / 3600)}h ago`;
 }
 
 function formatSpan(fromISO, toISO) {
@@ -188,6 +212,9 @@ function loadPrefs() {
     if (typeof saved.newestFirst === 'boolean') state.newestFirst = saved.newestFirst;
     if (typeof saved.autoScroll === 'boolean') state.autoScroll = saved.autoScroll;
     if (saved.targetKey) state.filters.targetKey = saved.targetKey;
+    if (saved.scopeText) state.scopeText = saved.scopeText;
+    if (typeof saved.ignoreApple === 'boolean') state.ignoreApple = saved.ignoreApple;
+    if (typeof saved.ignoreNoSubsystem === 'boolean') state.ignoreNoSubsystem = saved.ignoreNoSubsystem;
   } catch { /* ignore corrupt prefs */ }
 }
 
@@ -199,6 +226,9 @@ function savePrefs() {
       newestFirst: state.newestFirst,
       autoScroll: state.autoScroll,
       targetKey: state.filters.targetKey,
+      scopeText: state.scopeText,
+      ignoreApple: state.ignoreApple,
+      ignoreNoSubsystem: state.ignoreNoSubsystem,
     }));
   } catch { /* storage may be unavailable */ }
 }
@@ -213,6 +243,7 @@ class MultiSelect {
     this.placeholder = placeholder;
     this.selected = new Set();
     this.facets = [];
+    this.distinct = 0;
     this.open = false;
     this.filterText = '';
     this.build();
@@ -314,8 +345,9 @@ class MultiSelect {
     this.renderList();
   }
 
-  setFacets(facets) {
+  setFacets(facets, distinct) {
     this.facets = facets || [];
+    this.distinct = distinct || this.facets.length;
     this.renderButton();
     // Keep the rendered list in step with the data. The earlier "only refresh
     // while open" guard meant a value that appeared after the picker was last
@@ -345,7 +377,7 @@ class MultiSelect {
     const rows = this.facets.filter((f) => !this.filterText || f.value.toLowerCase().includes(this.filterText));
     const custom = [...this.selected].filter((v) => !this.facets.some((f) => f.value === v));
 
-    const add = (value, count, isCustom) => {
+    const add = (value, count, isCustom, lastSeen) => {
       const option = document.createElement('label');
       option.className = 'ms-option' + (isCustom ? ' custom' : '');
       const box = document.createElement('input');
@@ -368,17 +400,32 @@ class MultiSelect {
         countEl.textContent = String(count);
         option.append(countEl);
       }
+      if (lastSeen) {
+        const age = formatAgo(lastSeen);
+        const ageEl = document.createElement('span');
+        ageEl.className = 'ms-opt-age' + (age === 'now' ? '' : ' stale');
+        ageEl.textContent = age;
+        option.append(ageEl);
+      }
       this.list.append(option);
     };
 
-    for (const value of custom) add(value, undefined, true);
-    for (const facet of rows) add(facet.value, facet.count, false);
+    // Values are listed with their session totals: once a value has been seen it
+    // stays, so a subsystem that logged once an hour ago is still selectable even
+    // though the buffer has long since moved on.
+    for (const value of custom) add(value, undefined, true, null);
+    for (const facet of rows) add(facet.value, facet.count, false, facet.lastSeen);
 
     if (!this.list.childElementCount) {
       const empty = document.createElement('div');
       empty.className = 'ms-empty';
       empty.textContent = this.facets.length ? 'No values match' : 'No values seen yet';
       this.list.append(empty);
+    } else if (this.distinct > this.facets.length) {
+      const note = document.createElement('div');
+      note.className = 'ms-empty';
+      note.textContent = `showing ${this.facets.length} of ${this.distinct} values seen — use the search box`;
+      this.list.append(note);
     }
     this.list.scrollTop = previousScroll;
   }
@@ -487,6 +534,11 @@ async function toggleCapture() {
     return;
   }
 
+  // Starting always goes through the capture settings.
+  openCaptureModal({ starting: true });
+}
+
+async function startCapture() {
   const target = findTarget(state.filters.targetKey);
   if (!target) {
     showBanner('Select a log source first.', 'error');
@@ -510,6 +562,9 @@ async function toggleCapture() {
         model: target.model || '',
         level: state.filters.level,
         predicate: state.filters.predicate,
+        subsystems: parseScope(state.scopeText),
+        ignoreApple: state.ignoreApple,
+        ignoreNoSubsystem: state.ignoreNoSubsystem,
       }),
     });
     const data = await res.json();
@@ -589,6 +644,7 @@ function applyStatus(status, skipEpochCheck) {
   setText(dom.statCount, `${Number(status.received || 0).toLocaleString()} received`);
   setText(dom.statBuffer, `buffer ${Number(status.buffered || 0).toLocaleString()}/${Number(status.capacity || 0).toLocaleString()}`);
   setText(dom.statClients, `${status.clients || 0} viewer${status.clients === 1 ? '' : 's'}`);
+  renderScopeNote();
 
   dom.captureToggle.textContent = running ? 'Stop capture' : 'Start capture';
   dom.captureToggle.classList.toggle('running', running);
@@ -637,6 +693,110 @@ function renderNotes() {
     dom.historyNote.title = 'Start with -history to keep entries beyond the in-memory buffer.';
   }
   dom.dropNote.hidden = state.clientDropped + state.pendingDropped === 0;
+}
+
+/* ------------------------------------------------------- capture settings -- */
+
+// The three capture settings decide what is ever recorded, so they are collected
+// in a modal when a capture starts rather than being buried in the filter bar:
+// the difference between a manageable history and hundreds of megabytes is made
+// here, before anything is captured.
+
+let lastFocused = null;
+
+function openCaptureModal({ starting }) {
+  const status = state.status;
+  const running = !!(status && status.running);
+  const target = findTarget(state.filters.targetKey);
+
+  dom.captureModalSub.textContent = starting
+    ? `${target ? target.name : 'no source selected'} · level ${state.filters.level}`
+    : `Capture settings apply the next time you start. Currently capturing${status ? ` from ${status.target?.name || ''}` : ''}.`;
+
+  dom.captureSubsystems.value = state.scopeText;
+  dom.captureIgnoreApple.checked = state.ignoreApple;
+  dom.captureIgnoreNosubsystem.checked = state.ignoreNoSubsystem;
+
+  dom.captureModalStart.textContent = starting ? 'Start capture' : 'Save';
+  dom.captureModalCancel.textContent = starting ? 'Cancel' : 'Close';
+  dom.captureModalStart.disabled = !running ? false : !starting && false;
+
+  updateCaptureSummary();
+  lastFocused = document.activeElement;
+  dom.captureModal.hidden = false;
+  dom.captureSubsystems.focus();
+}
+
+function closeCaptureModal() {
+  dom.captureModal.hidden = true;
+  if (lastFocused && typeof lastFocused.focus === 'function') lastFocused.focus();
+}
+
+// readCaptureModal copies the modal's values into the persisted settings.
+function readCaptureModal() {
+  state.scopeText = dom.captureSubsystems.value;
+  state.ignoreApple = dom.captureIgnoreApple.checked;
+  state.ignoreNoSubsystem = dom.captureIgnoreNosubsystem.checked;
+  savePrefs();
+}
+
+function updateCaptureSummary() {
+  const subsystems = parseScope(dom.captureSubsystems.value);
+  const apple = dom.captureIgnoreApple.checked;
+  const noSubsystem = dom.captureIgnoreNosubsystem.checked;
+
+  const parts = [];
+  if (subsystems.length) parts.push(`only ${subsystems.length} subsystem${subsystems.length === 1 ? '' : 's'}`);
+  else parts.push('all subsystems');
+  // Mirrors the server: with an explicit list the com.apple exclusion is not
+  // applied, so the summary must not claim it is.
+  if (apple && !subsystems.length) parts.push('no com.apple');
+  if (noSubsystem) parts.push('with subsystem');
+
+  dom.captureModalSummary.textContent = `observing: ${parts.join(' · ')}`;
+
+  const hints = [];
+  if (subsystems.length && apple) {
+    hints.push('The subsystem list takes precedence: a listed com.apple subsystem is still captured, so the com.apple exclusion only applies when the list is empty.');
+  }
+  if (!subsystems.length && !apple && !noSubsystem) {
+    hints.push('Everything is captured. On a busy app that can add tens of megabytes per minute.');
+  } else {
+    hints.push('Filtering happens at the source where possible and is enforced again as entries arrive, so excluded entries never reach the buffer, the value list or the history file.');
+  }
+  if (noSubsystem) {
+    hints.push('"Ignore entries without a subsystem" is applied on arrival: macOS cannot filter on a missing subsystem.');
+  }
+  dom.captureModalHint.textContent = hints.join(' ');
+}
+
+// renderScopeNote makes the capture scope visible: it is the difference between
+// "this entry is not in the buffer" and "this entry was never captured".
+function renderScopeNote() {
+  const status = state.status;
+  const pending = parseScope(state.scopeText);
+
+  if (status && status.running) {
+    const listed = (status.scopeSubsystems || []).length;
+    const details = [];
+    if (listed) details.push(`${listed} subsystem${listed === 1 ? '' : 's'}`);
+    if (status.scopeIgnoreApple) details.push('no com.apple');
+    if (status.scopeIgnoreNoSubsystem) details.push('with subsystem');
+
+    let note = details.length ? `· observing ${details.join(' · ')}` : '· observing everything';
+    if (status.scopeDropped) note += ` · ${Number(status.scopeDropped).toLocaleString()} filtered out`;
+    setText(dom.scopeNote, `${note} — edit`);
+    dom.scopeNote.title = (status.scopeSubsystems || []).join('\n') || 'No subsystem restriction';
+    dom.scopeNote.hidden = false;
+    return;
+  }
+
+  const details = [pending.length ? `${pending.length} subsystem${pending.length === 1 ? '' : 's'}` : null,
+    state.ignoreApple ? 'no com.apple' : null,
+    state.ignoreNoSubsystem ? 'with subsystem' : null].filter(Boolean);
+  setText(dom.scopeNote, details.length ? `· will observe ${details.join(' · ')} — edit` : '· will observe everything — edit');
+  dom.scopeNote.title = parseScope(state.scopeText).join('\n') || 'No subsystem restriction';
+  dom.scopeNote.hidden = false;
 }
 
 function showBanner(message, kind, dismissable) {
@@ -1121,9 +1281,10 @@ function prependEntries(entries) {
 // applyFacets is fed by the snapshot, so the counts always describe the same
 // instant as the rows on screen.
 function applyFacets(facets) {
-  selects[0].setFacets(facets.subsystems);
-  selects[1].setFacets(facets.categories);
-  selects[2].setFacets(facets.processes);
+  const distinct = facets.distinct || {};
+  selects[0].setFacets(facets.subsystems, distinct.subsystems);
+  selects[1].setFacets(facets.categories, distinct.categories);
+  selects[2].setFacets(facets.processes, distinct.processes);
   state.levelFacets = new Map((facets.levels || []).map((f) => [f.value, f.count]));
   renderLevelChips();
 }
@@ -1135,7 +1296,7 @@ async function refreshFacets() {
   if (state.applying) return;
   if (!state.status || (!state.status.running && !state.status.total)) return;
   try {
-    const res = await api(`/api/facets?${filterParams()}&limit=400`);
+    const res = await api(`/api/facets?${filterParams()}&limit=1000`);
     if (!res.ok) return;
     applyFacets(await res.json());
   } catch { /* transient */ }
@@ -1297,6 +1458,45 @@ function wireEvents() {
     savePrefs();
   });
 
+  // Capture settings live in the modal; the footer note reopens it.
+  dom.scopeNote.addEventListener('click', () => openCaptureModal({ starting: false }));
+  for (const id of ['capture-subsystems', 'capture-ignore-apple', 'capture-ignore-nosubsystem']) {
+    dom[camel(id)].addEventListener('input', updateCaptureSummary);
+    dom[camel(id)].addEventListener('change', updateCaptureSummary);
+  }
+
+  dom.captureUseSelected.addEventListener('click', () => {
+    const selected = [...state.filters.subsystems];
+    if (!selected.length) {
+      showBanner('Select one or more subsystems in the picker first.', 'info', true);
+      return;
+    }
+    const merged = [...new Set([...parseScope(dom.captureSubsystems.value), ...selected])];
+    dom.captureSubsystems.value = merged.join('\n');
+    updateCaptureSummary();
+  });
+
+  dom.captureClearSubsystems.addEventListener('click', () => {
+    dom.captureSubsystems.value = '';
+    updateCaptureSummary();
+  });
+
+  dom.captureModalClose.addEventListener('click', closeCaptureModal);
+  dom.captureModalCancel.addEventListener('click', closeCaptureModal);
+  dom.captureModal.addEventListener('click', (ev) => {
+    // Clicking the backdrop dismisses, like a native sheet.
+    if (ev.target === dom.captureModal) closeCaptureModal();
+  });
+
+  dom.captureModalStart.addEventListener('click', async () => {
+    readCaptureModal();
+    const starting = dom.captureModalStart.textContent === 'Start capture';
+    closeCaptureModal();
+    renderScopeNote();
+    if (starting) await startCapture();
+    else showBanner('Capture settings saved; they apply the next time you start a capture.', 'info', true);
+  });
+
   dom.query.value = state.filters.query;
   dom.query.addEventListener('input', () => {
     state.filters.query = dom.query.value;
@@ -1415,12 +1615,19 @@ function wireEvents() {
   dom.copyLink.addEventListener('click', () => copyText(location.href, 'Share link'));
 
   document.addEventListener('keydown', (ev) => {
+    if (!dom.captureModal.hidden && ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) {
+      ev.preventDefault();
+      dom.captureModalStart.click();
+      return;
+    }
     if (ev.key === '/' && document.activeElement !== dom.query && !isTyping(ev.target)) {
       ev.preventDefault();
       dom.query.focus();
       dom.query.select();
     } else if (ev.key === 'Escape') {
-      if (!dom.detail.hidden) {
+      if (!dom.captureModal.hidden) {
+        closeCaptureModal();
+      } else if (!dom.detail.hidden) {
         dom.detail.hidden = true;
       } else if (document.activeElement === dom.query && dom.query.value) {
         dom.query.value = '';

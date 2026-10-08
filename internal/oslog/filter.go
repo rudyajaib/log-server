@@ -70,34 +70,26 @@ func NewFilter(values url.Values) (Filter, error) {
 	return f, nil
 }
 
-// Match reports whether the entry satisfies every configured restriction.
+// Match reports whether the entry satisfies every configured restriction. The
+// checks short-circuit, because this runs once per entry per viewer on the live
+// fan-out path and once per entry for every whole-buffer scan.
 func (f Filter) Match(e Entry) bool {
-	m := f.matches(e)
-	return m.subsystem && m.category && m.process && m.level && m.text && m.hasSubsystem
-}
-
-// dimensionMatch records which of the filter's restrictions an entry satisfies.
-// A single evaluation is enough to derive every relaxed view of the filter, which
-// is what lets one pass over the buffer produce all four facet lists plus the
-// match count instead of four separate passes.
-type dimensionMatch struct {
-	subsystem    bool
-	category     bool
-	process      bool
-	level        bool
-	text         bool
-	hasSubsystem bool
-}
-
-func (f Filter) matches(e Entry) dimensionMatch {
-	return dimensionMatch{
-		subsystem:    matchDimension(f.subsystemSet, f.Subsystems, e.Subsystem),
-		category:     matchDimension(f.categorySet, f.Categories, e.Category),
-		process:      matchDimension(f.processSet, f.Processes, e.Process),
-		level:        matchDimension(f.levelSet, f.Levels, e.Level),
-		text:         f.MatchText(e),
-		hasSubsystem: !f.RequireSubsystem || e.Subsystem != "",
+	if f.RequireSubsystem && e.Subsystem == "" {
+		return false
 	}
+	if !matchDimension(f.subsystemSet, f.Subsystems, e.Subsystem) {
+		return false
+	}
+	if !matchDimension(f.categorySet, f.Categories, e.Category) {
+		return false
+	}
+	if !matchDimension(f.processSet, f.Processes, e.Process) {
+		return false
+	}
+	if !matchDimension(f.levelSet, f.Levels, e.Level) {
+		return false
+	}
+	return f.MatchText(e)
 }
 
 // MatchText applies only the free text query. Each field is tested on its own so
@@ -146,28 +138,6 @@ func (f Filter) MatchesText(haystack string) bool {
 func (f Filter) MatchAll() bool {
 	return len(f.Subsystems) == 0 && len(f.Categories) == 0 && len(f.Processes) == 0 &&
 		len(f.Levels) == 0 && f.Query == "" && !f.RequireSubsystem
-}
-
-// WithoutDimension returns a copy of the filter with one dimension cleared. It is
-// used to compute cascading facet lists: the list of subsystems must not be
-// narrowed by the currently selected subsystems.
-func (f Filter) WithoutDimension(dimension string) Filter {
-	switch dimension {
-	case "subsystem":
-		f.Subsystems = nil
-		f.subsystemSet = nil
-		f.RequireSubsystem = false
-	case "category":
-		f.Categories = nil
-		f.categorySet = nil
-	case "process":
-		f.Processes = nil
-		f.processSet = nil
-	case "level":
-		f.Levels = nil
-		f.levelSet = nil
-	}
-	return f
 }
 
 // Describe renders a short human readable summary used in export file headers.

@@ -33,46 +33,46 @@ type Options struct {
 // Status is the payload sent to clients describing the current capture.
 type Status struct {
 	oslog.Status
-	Total        uint64        `json:"total"`
-	Buffered     int           `json:"buffered"`
-	Capacity     int           `json:"capacity"`
-	Evicted      uint64        `json:"evicted"`
-	BufferFrom   string        `json:"bufferFrom,omitempty"`
-	BufferTo     string        `json:"bufferTo,omitempty"`
-	Rate         float64       `json:"rate"`
-	Clients      int           `json:"clients"`
-	Matched      int           `json:"matched"`
-	Admin        bool          `json:"admin"`
-	DeviceNotice string        `json:"deviceNotice,omitempty"`
-	History      history.Stats `json:"history"`
+	Total             uint64        `json:"total"`
+	Buffered          int           `json:"buffered"`
+	Capacity          int           `json:"capacity"`
+	Evicted           uint64        `json:"evicted"`
+	BufferFrom        string        `json:"bufferFrom,omitempty"`
+	BufferTo          string        `json:"bufferTo,omitempty"`
+	Rate              float64       `json:"rate"`
+	Clients           int           `json:"clients"`
+	Matched           int           `json:"matched"`
+	Scope             string        `json:"scope"`
+	ScopeList         []string      `json:"scopeSubsystems,omitempty"`
+	ScopeIgnoreApple  bool          `json:"scopeIgnoreApple"`
+	ScopeIgnoreNoSubs bool          `json:"scopeIgnoreNoSubsystem"`
+	ScopeDropped      uint64        `json:"scopeDropped"`
+	Values            int           `json:"values"`
+	Admin             bool          `json:"admin"`
+	DeviceNotice      string        `json:"deviceNotice,omitempty"`
+	History           history.Stats `json:"history"`
 }
 
 // Server implements http.Handler.
 type Server struct {
-	opts   Options
-	logger *log.Logger
-	buf    *oslog.Buffer
-	hub    *hub
-	web    http.Handler
+	opts    Options
+	logger  *log.Logger
+	buf     *oslog.Buffer
+	catalog *oslog.Catalog
+	hub     *hub
+	web     http.Handler
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu              sync.Mutex
 	streamer        *oslog.Streamer
+	scope           oslog.Scope
+	scopeDropped    uint64
 	rate            float64
 	lastSampleTotal uint64
 	lastSampleAt    time.Time
-
-	facetsMu  sync.Mutex
-	facetsKey string
-	facetsAt  time.Time
-	facets    oslog.ScopedFacets
 }
-
-// facetCacheTTL bounds how often the whole-buffer facet scan can run for a given
-// filter, no matter how many viewers are polling.
-const facetCacheTTL = 1200 * time.Millisecond
 
 // New creates a server. Call Close to release resources.
 func New(opts Options) *Server {
@@ -87,6 +87,7 @@ func New(opts Options) *Server {
 		opts:         opts,
 		logger:       opts.Logger,
 		buf:          oslog.NewBuffer(opts.BufferSize),
+		catalog:      oslog.NewCatalog(),
 		hub:          newHub(),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -161,6 +162,12 @@ type startRequest struct {
 	Predicate string `json:"predicate"`
 	Runtime   string `json:"runtime"`
 	Model     string `json:"model"`
+	// The capture scope. It is pushed into the `log stream` predicate where that is
+	// possible and enforced again as entries arrive, so everything outside it never
+	// reaches the buffer, the catalog or the history file.
+	Subsystems        []string `json:"subsystems"`
+	IgnoreApple       bool     `json:"ignoreApple"`
+	IgnoreNoSubsystem bool     `json:"ignoreNoSubsystem"`
 }
 
 func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +199,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "predicate is too long")
 		return
 	}
+	scope, err := oslog.NewScope(req.Subsystems)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scope.IgnoreApple = req.IgnoreApple
+	scope.IgnoreNoSubsystem = req.IgnoreNoSubsystem
 
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
@@ -215,15 +229,18 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Lock()
+	s.scope = scope
+	s.scopeDropped = 0
+	s.catalog.Reset()
 	s.rate = 0
 	s.lastSampleTotal = 0
 	s.lastSampleAt = time.Now()
 	s.mu.Unlock()
 
-	err := streamer.Start(s.ctx, oslog.Options{
+	err = streamer.Start(s.ctx, oslog.Options{
 		Target:    target,
 		Level:     level,
-		Predicate: predicate,
+		Predicate: scope.Predicate(predicate),
 		OnEntry:   s.handleEntry,
 		OnStatus:  func(oslog.Status) { s.hub.broadcastStatus(s.status()) },
 		Logger:    s.logger,
@@ -233,7 +250,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.logger.Printf("capture started: %s %q (%s, level=%s)", target.Kind, target.Name, target.ID, level)
+	s.logger.Printf("capture started: %s %q (%s, level=%s, scope=%s)", target.Kind, target.Name, target.ID, level, scope.Describe())
+	if effective := scope.Predicate(predicate); effective != "" {
+		s.logger.Printf("capture predicate: %s", effective)
+	}
+	if scope.IgnoreNoSubsystem {
+		s.logger.Printf("entries without a subsystem are dropped on arrival (not expressible in a predicate)")
+	}
 	writeJSON(w, http.StatusOK, s.status())
 }
 
@@ -252,7 +275,18 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEntry(e oslog.Entry) {
+	// The scope is applied again here, not only in the `log stream` predicate, so
+	// that out-of-scope entries cannot reach the buffer, the catalog or the
+	// history file even if the predicate was ignored or unsupported.
+	if !s.inScope(e) {
+		s.mu.Lock()
+		s.scopeDropped++
+		s.mu.Unlock()
+		return
+	}
+
 	stored := s.buf.Add(e)
+	s.catalog.Record(stored)
 	if s.opts.History != nil {
 		if err := s.opts.History.Append(stored); err != nil {
 			s.logger.Printf("history append failed: %v", err)
@@ -282,35 +316,44 @@ func (s *Server) handleFacets(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	limit := intParam(r, "limit", 500, 1, 5000)
-	writeJSON(w, http.StatusOK, s.cachedFacets(r, filter, limit))
+	limit := intParam(r, "limit", 1000, 1, 20000)
+	writeJSON(w, http.StatusOK, s.facets(filter, limit))
 }
 
-// cachedFacets serves the periodic facet polls from a short lived cache. Several
-// open viewers (and each viewer's own timer) would otherwise recompute the same
-// four lists over the whole buffer, and every recomputation holds the buffer lock
-// that ingest needs.
-func (s *Server) cachedFacets(r *http.Request, filter oslog.Filter, limit int) oslog.ScopedFacets {
-	key := r.URL.RawQuery
-	now := time.Now()
+// facetsResponse is the value catalog plus the context a viewer needs to read it.
+type facetsResponse struct {
+	oslog.CatalogFacets
+	Matched  int    `json:"matched"`
+	Buffered int    `json:"buffered"`
+	Evicted  uint64 `json:"evicted"`
+	Scope    string `json:"scope"`
+}
 
-	s.facetsMu.Lock()
-	if s.facetsKey == key && now.Sub(s.facetsAt) < facetCacheTTL {
-		cached := s.facets
-		s.facetsMu.Unlock()
-		cached.Total = s.buf.Total()
-		cached.Buffered = s.buf.Len()
-		cached.Evicted = s.buf.Evicted()
-		return cached
+// facets reports the values seen during the whole capture rather than only those
+// in the buffer. A buffer-scoped list made rare subsystems flicker in and out as
+// the window slid past them; a session list stays put and stays selectable.
+func (s *Server) facets(filter oslog.Filter, limit int) facetsResponse {
+	return facetsResponse{
+		CatalogFacets: s.catalog.Facets(limit),
+		Matched:       s.buf.Count(filter),
+		Buffered:      s.buf.Len(),
+		Evicted:       s.buf.Evicted(),
+		Scope:         s.scopeDescription(),
 	}
-	s.facetsMu.Unlock()
+}
 
-	result := s.buf.ScopedFacets(filter, limit)
+func (s *Server) scopeDescription() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.scope.Describe()
+}
 
-	s.facetsMu.Lock()
-	s.facetsKey, s.facetsAt, s.facets = key, time.Now(), result
-	s.facetsMu.Unlock()
-	return result
+// inScope reports whether an entry is inside the capture scope.
+func (s *Server) inScope(e oslog.Entry) bool {
+	s.mu.Lock()
+	scope := s.scope
+	s.mu.Unlock()
+	return scope.Match(e)
 }
 
 type logsResponse struct {
@@ -488,16 +531,26 @@ func (s *Server) status() Status {
 }
 
 func (s *Server) buildStatus(st oslog.Status, rate float64) Status {
+	s.mu.Lock()
+	scope, dropped := s.scope, s.scopeDropped
+	s.mu.Unlock()
+
 	out := Status{
-		Status:       st,
-		Total:        s.buf.Total(),
-		Buffered:     s.buf.Len(),
-		Capacity:     s.buf.Capacity(),
-		Evicted:      s.buf.Evicted(),
-		Rate:         rate,
-		Clients:      s.hub.clientCount(),
-		Admin:        isAdmin(),
-		DeviceNotice: deviceNotice(),
+		Status:            st,
+		Total:             s.buf.Total(),
+		Buffered:          s.buf.Len(),
+		Capacity:          s.buf.Capacity(),
+		Evicted:           s.buf.Evicted(),
+		Rate:              rate,
+		Clients:           s.hub.clientCount(),
+		Scope:             scope.Describe(),
+		ScopeList:         scope.Subsystems,
+		ScopeIgnoreApple:  scope.IgnoreApple,
+		ScopeIgnoreNoSubs: scope.IgnoreNoSubsystem,
+		ScopeDropped:      dropped,
+		Values:            s.catalog.Distinct(),
+		Admin:             isAdmin(),
+		DeviceNotice:      deviceNotice(),
 	}
 	if oldest, newest, ok := s.buf.TimeSpan(); ok {
 		out.BufferFrom = oldest.Format(time.RFC3339Nano)

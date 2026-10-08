@@ -98,18 +98,20 @@ func TestStatusAndFacetsReflectBuffer(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/facets?subsystem=com.a", nil))
-	var facets oslog.ScopedFacets
+	var facets facetsResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &facets); err != nil {
 		t.Fatalf("decoding facets: %v", err)
 	}
+	// The match count respects the filter, but the value lists are session wide so
+	// that a selection can always be changed.
 	if facets.Matched != 1 {
 		t.Errorf("Matched = %d, want 1", facets.Matched)
 	}
-	if len(facets.Categories) != 1 || facets.Categories[0].Value != "net" {
-		t.Errorf("categories = %+v, want just net", facets.Categories)
-	}
 	if len(facets.Subsystems) != 2 {
-		t.Errorf("subsystems = %+v, want the full list so the selection can change", facets.Subsystems)
+		t.Errorf("subsystems = %+v, want every value seen this session", facets.Subsystems)
+	}
+	if len(facets.Categories) != 2 {
+		t.Errorf("categories = %+v, want every value seen this session", facets.Categories)
 	}
 }
 
@@ -218,12 +220,13 @@ func TestSnapshotCarriesFacetsAndOlderFlag(t *testing.T) {
 	if payload.Matched != 1 || len(payload.Entries) != 1 {
 		t.Errorf("matched %d with %d entries, want 1 and 1", payload.Matched, len(payload.Entries))
 	}
-	// The facets travel with the snapshot so counts and rows cannot disagree.
-	if len(payload.Facets.Categories) != 1 || payload.Facets.Categories[0].Value != "net" {
-		t.Errorf("facets categories = %+v, want just net", payload.Facets.Categories)
-	}
+	// The value lists are session wide, so a subsystem that stops logging stays
+	// selectable instead of disappearing as the buffer window slides past it.
 	if len(payload.Facets.Subsystems) != 2 {
-		t.Errorf("facets subsystems = %+v, want both so the selection stays changeable", payload.Facets.Subsystems)
+		t.Errorf("facets subsystems = %+v, want every value seen this session", payload.Facets.Subsystems)
+	}
+	if len(payload.Facets.Categories) != 2 {
+		t.Errorf("facets categories = %+v, want every value seen this session", payload.Facets.Categories)
 	}
 	if payload.Older {
 		t.Error("Older = true, but nothing matches below the snapshot")
@@ -457,5 +460,168 @@ func nextEvent(t *testing.T, events <-chan string, want string) string {
 		case <-deadline:
 			t.Fatalf("timed out waiting for a %q event", want)
 		}
+	}
+}
+
+// TestCaptureScopeFiltersAtIngest covers the point of the subsystem allowlist:
+// out-of-scope entries must not reach the buffer, the catalog or the history file,
+// which is what keeps a chatty app from producing hundreds of megabytes.
+func TestCaptureScopeFiltersAtIngest(t *testing.T) {
+	dir := t.TempDir()
+	store, err := history.Open(filepath.Join(dir, "session.ndjson"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	s := New(Options{WebFS: fstest.MapFS{}, BufferSize: 100, Logger: log.New(io.Discard, "", 0), History: store})
+	t.Cleanup(s.Close)
+
+	s.handleStartScope(t, []string{"centrifugo-websocket.futures.open-order", "com.a"})
+
+	s.handleEntry(oslog.Entry{Subsystem: "centrifugo-websocket.futures.open-order", Level: "Debug", Message: "wanted"})
+	s.handleEntry(oslog.Entry{Subsystem: "com.apple.network", Level: "Debug", Message: "noise"})
+	s.handleEntry(oslog.Entry{Subsystem: "com.a", Level: "Info", Message: "also wanted"})
+
+	status := s.status()
+	if status.Buffered != 2 {
+		t.Errorf("buffered %d entries, want 2 in scope", status.Buffered)
+	}
+	if status.ScopeDropped != 1 {
+		t.Errorf("ScopeDropped = %d, want 1", status.ScopeDropped)
+	}
+
+	facets := s.facets(oslog.Filter{}, 0)
+	if _, ok := findFacetValue(facets.Subsystems, "com.apple.network"); ok {
+		t.Error("an out-of-scope subsystem leaked into the value list")
+	}
+	if _, ok := findFacetValue(facets.Subsystems, "centrifugo-websocket.futures.open-order"); !ok {
+		t.Error("the scoped subsystem should be listed")
+	}
+
+	stored, _, err := store.Query(oslog.Filter{}, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range stored {
+		if e.Subsystem == "com.apple.network" {
+			t.Error("an out-of-scope entry was written to the history file")
+		}
+	}
+	if len(stored) != 2 {
+		t.Errorf("history holds %d entries, want only the 2 in scope", len(stored))
+	}
+}
+
+func TestStartRejectsInvalidScope(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/stream/start",
+		strings.NewReader(`{"kind":"simulator","id":"x","subsystems":["com.a\" OR 1==1"]}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an invalid subsystem name", rec.Code)
+	}
+}
+
+func TestFacetsComeFromTheWholeSessionNotJustTheBuffer(t *testing.T) {
+	s := newTestServer(t)
+	// Buffer holds 100 entries; the rare value is pushed out of it long before it
+	// leaves the session value list.
+	s.handleEntry(oslog.Entry{Subsystem: "rare.subsystem", Level: "Debug", Message: "rare"})
+	for i := 0; i < 300; i++ {
+		s.handleEntry(oslog.Entry{Subsystem: "com.apple.network", Level: "Debug", Message: "noise"})
+	}
+
+	if got := s.buf.Len(); got != 100 {
+		t.Fatalf("buffer holds %d entries, want the 100 entry cap", got)
+	}
+	inBuffer := false
+	for _, e := range s.buf.All() {
+		if e.Subsystem == "rare.subsystem" {
+			inBuffer = true
+		}
+	}
+	if inBuffer {
+		t.Fatal("precondition: the rare subsystem should have been evicted")
+	}
+
+	facets := s.facets(oslog.Filter{}, 0)
+	facet, ok := findFacetValue(facets.Subsystems, "rare.subsystem")
+	if !ok {
+		t.Fatalf("rare.subsystem is missing from the value list: %+v", facets.Subsystems)
+	}
+	if facet.Count != 1 {
+		t.Errorf("session count = %d, want 1", facet.Count)
+	}
+}
+
+// handleStartScope installs a capture scope the way handleStart does.
+func (s *Server) handleStartScope(t *testing.T, subsystems []string) {
+	t.Helper()
+	scope, err := oslog.NewScope(subsystems)
+	if err != nil {
+		t.Fatalf("NewScope: %v", err)
+	}
+	s.mu.Lock()
+	s.scope = scope
+	s.scopeDropped = 0
+	s.mu.Unlock()
+	s.catalog.Reset()
+}
+
+func findFacetValue(facets []oslog.Facet, value string) (oslog.Facet, bool) {
+	for _, f := range facets {
+		if f.Value == value {
+			return f, true
+		}
+	}
+	return oslog.Facet{}, false
+}
+
+// TestStartAppliesCaptureSettings checks the three modal settings reach the
+// scope. A device target is used because it fails immediately without admin
+// rights - the scope is stored before the stream starts, so it can be asserted
+// without spawning a simulator capture.
+func TestStartAppliesCaptureSettings(t *testing.T) {
+	s := newTestServer(t)
+	handler := s.Handler()
+
+	body := `{"kind":"device","id":"no-such-device","name":"Test","level":"debug",
+	          "subsystems":["centrifugo-websocket.futures.open-order"],
+	          "ignoreApple":true,"ignoreNoSubsystem":true}`
+	req := httptest.NewRequest(http.MethodPost, "/api/stream/start", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	var status Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decoding status: %v", err)
+	}
+
+	if !status.ScopeIgnoreApple || !status.ScopeIgnoreNoSubs {
+		t.Errorf("exclusion flags did not reach the status: %+v", status)
+	}
+	if len(status.ScopeList) != 1 || status.ScopeList[0] != "centrifugo-websocket.futures.open-order" {
+		t.Errorf("ScopeList = %v, want the posted subsystem", status.ScopeList)
+	}
+	// The list is decisive, so the predicate must be the list alone.
+	if strings.Contains(status.Predicate, "NOT subsystem") {
+		t.Errorf("predicate = %q, want the list only", status.Predicate)
+	}
+	if !strings.Contains(status.Predicate, "centrifugo-websocket.futures.open-order") {
+		t.Errorf("predicate = %q, want the posted subsystem", status.Predicate)
+	}
+
+	// And the settings must actually filter.
+	s.handleEntry(oslog.Entry{Subsystem: "centrifugo-websocket.futures.open-order", Message: "keep"})
+	s.handleEntry(oslog.Entry{Subsystem: "com.apple.network", Message: "drop: apple"})
+	s.handleEntry(oslog.Entry{Subsystem: "", Message: "drop: no subsystem"})
+	if got := s.buf.Len(); got != 1 {
+		t.Errorf("buffered %d entries, want only the one inside the scope", got)
 	}
 }

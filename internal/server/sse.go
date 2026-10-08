@@ -94,14 +94,14 @@ func (h *hub) broadcastStatus(s Status) {
 }
 
 type snapshotPayload struct {
-	Mode      string             `json:"mode"` // full | resume
-	Entries   []oslog.Entry      `json:"entries"`
-	Matched   int                `json:"matched"`
-	Truncated bool               `json:"truncated"`
-	Older     bool               `json:"older"`
-	Facets    oslog.ScopedFacets `json:"facets"`
-	Filter    oslog.Filter       `json:"filter"`
-	Status    Status             `json:"status"`
+	Mode      string              `json:"mode"` // full | resume
+	Entries   []oslog.Entry       `json:"entries"`
+	Matched   int                 `json:"matched"`
+	Truncated bool                `json:"truncated"`
+	Older     bool                `json:"older"`
+	Facets    oslog.CatalogFacets `json:"facets"`
+	Filter    oslog.Filter        `json:"filter"`
+	Status    Status              `json:"status"`
 }
 
 // handleSSE streams log entries to the browser as Server-Sent Events.
@@ -142,7 +142,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 	defer s.hub.unsubscribe(client)
 
 	mode := "full"
-	entries, matched, facets := s.buf.Snapshot(filter, snapshotLimit, resumeID)
+	entries, matched := s.buf.Snapshot(filter, snapshotLimit, resumeID)
 	if resumeID > 0 {
 		mode = "resume"
 	}
@@ -164,7 +164,7 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		Matched:   matched,
 		Truncated: matched > len(entries),
 		Older:     older,
-		Facets:    facets,
+		Facets:    s.catalog.Facets(1000),
 		Filter:    filter,
 		Status:    s.status(),
 	})

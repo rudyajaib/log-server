@@ -91,21 +91,34 @@ searches everything that has been received.
 
 | Control | Behaviour |
 |---------|-----------|
-| **Subsystem** / **Category** / **Process** | Multi-select pickers populated from the live stream with counts. Selections act as OR inside a picker and AND across pickers. `*` wildcards work (e.g. `com.apple.*`). |
+| **Subsystem** / **Category** / **Process** | Multi-select pickers showing every value seen during the capture with its session total. Selections act as OR inside a picker and AND across pickers. `*` wildcards work (e.g. `com.apple.*`). |
 | **Level** | Toggles for `Error`, `Fault`, `Default`, `Info`, `Debug`, `Signpost`, `Activity`, `Loss`, … |
 | **Search** | Case-insensitive substring across message, subsystem, category, process and level. `.*` switches to a regular expression, `Aa` makes it case sensitive. Matches are highlighted. |
 | **hide entries without a subsystem** | Hides noisy framework output that carries no subsystem. |
-| **Predicate** | An NSPredicate appended to the `log stream` command (e.g. `subsystem == "example.websocket"`). It reduces work at the source and applies when a capture starts. |
+| **Predicate** | An extra NSPredicate for the `log stream` command (e.g. `subsystem BEGINSWITH "com.example"`), combined with the capture settings using AND. |
 
 Changing a filter never empties the view: the rows on screen stay put until the new
-snapshot arrives, at which point they are swapped in one step. The picker counts and the
-match count come from that same snapshot, so they always describe what the rows do.
+snapshot arrives, at which point they are swapped in one step.
 
-The picker lists are kept live too, including while a picker is open: a subsystem that
-only starts logging now appears in the list within a few seconds. If a value seems to be
-missing anyway, the list is truncated to the top 400 values by count, so a very chatty
-stream can push a rare one out — use the search box inside the picker, or filter by
-process instead.
+### The value list is scoped to the capture, not to the buffer
+
+The pickers list **every value seen since the capture started**, each with its session total
+and how long ago it was last logged (`2m ago`, highlighted once it stops). Values are never
+removed while a capture runs, so a subsystem that logs once every fifteen minutes stays
+selectable instead of appearing and then vanishing as the buffer window slides past it.
+
+That matters because the buffer is a window measured in seconds. Measured on a live
+simulator with a 3,000 entry buffer: 29,553 entries had been evicted and the window covered
+about 1.8 seconds. Six subsystems were still listed whose entries had *all* left the buffer;
+a buffer-scoped list showed 24 values where the session list showed 30.
+
+Selecting a value that is no longer in the buffer is not a dead end — "Load older", or
+scrolling to the oldest row, pages backwards through the history file to find it.
+
+Each picker is capped at the 1,000 most frequent values (the popover says so when a cap is
+hit, e.g. `showing 1000 of 1234 values seen`); the search box inside the picker filters the
+list, and the catalog itself is capped per dimension so a long session cannot grow it without
+limit.
 
 ### Rendering at high rates
 
@@ -115,6 +128,51 @@ browser receives is kept, but only the newest 800 rows live in the DOM at once (
 memory, and paging continues into the history file, so nothing is lost. Appends are batched
 into one animation frame instead of one per network message, which keeps frame times flat as
 the rate climbs — worth knowing if you were seeing sluggishness on a busy stream.
+
+### Capture settings
+
+Pressing **Start capture** opens a dialog with three settings, because they decide what is ever
+recorded — the difference between a manageable history and hundreds of megabytes is made here,
+before anything is captured. The footer shows the current setting and reopens the dialog
+(`· observing 2 subsystems — edit`).
+
+| Setting | Effect |
+|---------|--------|
+| **Only these subsystems** | One per line. When set, only those subsystems are captured. Empty means everything. |
+| **Ignore everything from `com.apple`** | Drops the system namespace, which is noise when investigating your own app. |
+| **Ignore entries without a subsystem** | Drops entries carrying no subsystem at all — usually framework chatter. |
+
+Where possible the settings become part of the `log stream` predicate so the filtering happens
+at the source, and they are enforced *again* as entries arrive, so an excluded entry never
+reaches the buffer, the value list or the history file even if the predicate is ignored.
+
+Two rules are worth knowing:
+
+* **An explicit subsystem list is decisive.** A listed `com.apple.*` subsystem is still
+  captured even with the com.apple exclusion ticked, and the predicate is emitted as the list
+  alone. Adding both would produce a predicate that contradicts itself and captures nothing —
+  the dialog says so when you tick both.
+* **"Ignore entries without a subsystem" is applied on arrival, not at the source.** NSPredicate
+  cannot express it: `subsystem != ""` does not exclude a missing subsystem (measured: 9,926
+  events kept where 7,667 was correct) and `subsystem.length` is not a valid field. It still
+  keeps such entries out of the buffer, the list and the file.
+
+### Keeping the capture small
+
+Unscoped, the history file grows quickly: 656 bytes per entry measured on a live app, so a
+firehose of ~1,250 entries/s adds about **47 MB per minute** and fills the default 256 MB cap
+in a few minutes. Two ways to bring that down:
+
+1. **Scope the capture.** Put the subsystems you care about in the capture settings. Filtering
+   at the source reduced this capture from ~800 entries/s to ~72/s, and scoping to a sparse
+   subsystem such as a websocket client reduces it to a handful of entries per minute — a few
+   KB per minute, which the history file will hold for weeks. Ticking both exclusions on this
+   workload removed every remaining event.
+2. **Raise the level only as far as you need.** `Info` and `Debug` are an order of magnitude
+   more verbose than `Default`; see the table below.
+
+The footer always shows what is being recorded (`· observing 2 subsystems`, `· history 39,225
+entries (23 MB)`), and `-history-max-mb` sets the cap.
 
 ### Capture level matters more than you expect
 
@@ -144,11 +202,11 @@ bound what is on screen, and both shrink as the log rate rises:
 A subsystem that logs once every fifteen minutes will usually fall outside both windows,
 while a subsystem logging every few seconds is nearly always present. Three ways to fix it:
 
-1. **Filter at the source** with the Predicate field, e.g. `subsystem CONTAINS "example"`.
-   Volume collapses, so the buffer covers hours instead of seconds.
-2. **Scroll back.** "Load older" (or scrolling to the oldest row) pages backwards through
-   the buffer and then into the on-disk history, so anything captured this session is
-   reachable regardless of the rate.
+1. **Scope at the source** with *Observe only these subsystems*, e.g. the websocket
+   subsystems. Volume collapses, so the buffer covers hours instead of seconds.
+2. **Select it anyway.** The value list is session scoped, so the subsystem is still listed
+   (with a stale timestamp) even after its entries have left the buffer. Pick it, then press
+   *Load older* to read back through the history file.
 3. **Raise `-buffer`** if you prefer to keep more in RAM.
 
 The address bar always mirrors the current filter, so it can be bookmarked or shared.
@@ -177,7 +235,7 @@ The UI is a client of this API, which is handy for automation:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `GET` | `/api/targets` | Available simulators and connected devices |
-| `POST` | `/api/stream/start` | Start a capture: `{"kind":"simulator\|device","id":"<udid>","name":"…","level":"debug\|info\|default","predicate":"…"}` |
+| `POST` | `/api/stream/start` | Start a capture: `{"kind":"simulator\|device","id":"<udid>","name":"…","level":"debug\|info\|default","predicate":"…","subsystems":["…"],"ignoreApple":true,"ignoreNoSubsystem":true}` |
 | `POST` | `/api/stream/stop` | Stop the capture |
 | `GET` | `/api/status` | Capture state, counters, rate, errors. Pass the same filter parameters to get an accurate `matched` count for that view. |
 | `GET` | `/api/facets` | Subsystem/category/process/level counts, scoped by the current filter |
@@ -207,15 +265,19 @@ with `Last-Event-ID` receives only what it missed.
   non-JSON notices such as `Filtering the log data using …` are ignored.
 * **Buffer** – a fixed-capacity ring buffer with monotonically increasing IDs. IDs let a browser
   reconnect and continue exactly where it left off even after older entries were evicted.
+* **Catalog** – a small per-dimension index of every value seen since the capture started, with a
+  session total and a last-seen time. The pickers read this rather than the buffer, because a
+  buffer-shaped value list churns: a rare subsystem is inside the window for well under a second.
 * **History** – every entry is also appended to a newline delimited JSON file. Backwards paging
   reads that file from the end in blocks, so reading older entries costs only as much as it
   needs to and a session can be explored far past the RAM buffer. The file is truncated when a
   new capture starts, keeping it aligned with the buffer.
-* **Scanning** – the whole-buffer scans the UI needs (facet counts, match counts) run once per
-  entry with a lowercase haystack prepared at ingest, and the periodic facet poll is cached for
-  just over a second so several open viewers cannot multiply the work. These scans hold the
-  buffer lock, so their cost is ingest latency, which is why they are kept to a couple of
-  milliseconds rather than tens.
+* **Scanning** – the value list needs no buffer scan at all; it is maintained as entries
+  arrive. Only the match count walks the buffer, with a lowercase haystack prepared at ingest so
+  it costs about a millisecond per 20,000 entries. These scans hold the buffer lock, so their
+  cost is ingest latency, which is why they are kept small.
+* **Scope** – an optional subsystem allowlist becomes part of the `log stream` predicate and is
+  checked again in the ingest path, so out-of-scope entries occupy nothing.
 * **Fan-out** – each browser subscription carries its own filter, so a viewer never receives the
   unfiltered firehose. Entries are coalesced into batches; a viewer that cannot keep up drops
   entries and is told how many, rather than stalling the capture.

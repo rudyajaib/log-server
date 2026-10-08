@@ -117,43 +117,6 @@ func ids(entries []Entry) []uint64 {
 	return out
 }
 
-func TestBufferScopedFacetsAreCascading(t *testing.T) {
-	b := NewBuffer(50)
-	seed := []Entry{
-		{Subsystem: "com.a", Category: "net", Process: "App", Level: "Info"},
-		{Subsystem: "com.a", Category: "db", Process: "App", Level: "Error"},
-		{Subsystem: "com.b", Category: "net", Process: "Other", Level: "Info"},
-	}
-	for _, e := range seed {
-		b.Add(e)
-	}
-
-	filter, err := NewFilter(map[string][]string{"subsystem": {"com.a"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scoped := b.ScopedFacets(filter, 0)
-
-	if scoped.Matched != 2 {
-		t.Errorf("Matched = %d, want 2", scoped.Matched)
-	}
-	// Categories are narrowed by the subsystem filter.
-	if len(scoped.Categories) != 2 {
-		t.Fatalf("categories = %+v, want net and db", scoped.Categories)
-	}
-	// The subsystem list keeps other subsystems so the selection stays changeable.
-	values := map[string]int{}
-	for _, f := range scoped.Subsystems {
-		values[f.Value] = f.Count
-	}
-	if values["com.b"] != 1 {
-		t.Errorf("subsystem facets = %+v, want com.b to remain visible", scoped.Subsystems)
-	}
-	if values["com.a"] != 2 {
-		t.Errorf("subsystem facets = %+v, want com.a to count 2", scoped.Subsystems)
-	}
-}
-
 func TestBufferConcurrentAccess(t *testing.T) {
 	b := NewBuffer(64)
 	done := make(chan struct{})
@@ -166,24 +129,11 @@ func TestBufferConcurrentAccess(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		b.All()
 		b.Since(uint64(i))
-		b.ScopedFacets(Filter{}, 10)
+		b.Count(Filter{})
 		b.Len()
 	}
 	<-done
 	if b.Total() != 500 {
 		t.Errorf("Total = %d, want 500", b.Total())
-	}
-}
-
-func TestTopFacetsOrdering(t *testing.T) {
-	facets := topFacets(map[string]int{"b": 2, "a": 2, "c": 5}, 2)
-	if len(facets) != 2 {
-		t.Fatalf("got %d facets, want 2", len(facets))
-	}
-	if facets[0].Value != "c" || facets[0].Count != 5 {
-		t.Errorf("first facet = %+v, want the highest count", facets[0])
-	}
-	if facets[1].Value != "a" {
-		t.Errorf("second facet = %+v, want ties broken alphabetically", facets[1])
 	}
 }

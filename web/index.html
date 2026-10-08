@@ -78,7 +78,7 @@
 
   <div class="filter-row advanced" id="advanced-row" hidden>
     <label class="field grow">
-      <span>Base predicate — NSPredicate evaluated at the source, e.g. <code>subsystem == "com.example.app"</code> (used the next time a capture starts)</span>
+      <span>Base predicate — an extra NSPredicate evaluated at the source, e.g. <code>subsystem BEGINSWITH "com.example"</code>; combined with the capture settings using AND</span>
       <input id="predicate" placeholder="subsystem BEGINSWITH &quot;com.example&quot;" autocomplete="off" spellcheck="false">
     </label>
   </div>
@@ -109,6 +109,7 @@
     <span id="visible-count">0 loaded</span>
     <span id="match-count" class="muted"></span>
     <span id="buffer-note" class="muted"></span>
+    <button id="scope-note" class="link-btn scope-note" hidden></button>
     <span id="history-note" class="muted"></span>
     <button id="history-clear" class="link-btn" hidden title="Empty the history file and resume recording">clear history</button>
     <span id="drop-note" class="warn" hidden></span>
@@ -134,6 +135,46 @@
   </header>
   <pre id="detail-body"></pre>
 </aside>
+
+<div id="capture-modal" class="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="capture-modal-title">
+    <header>
+      <h2 id="capture-modal-title">Start capture</h2>
+      <button id="capture-modal-close" class="icon-btn" aria-label="Close">×</button>
+    </header>
+
+    <p class="modal-sub" id="capture-modal-sub"></p>
+
+    <div class="modal-body">
+      <label class="field">
+        <span>Only these subsystems — one per line; leave empty to capture everything</span>
+        <textarea id="capture-subsystems" rows="5" spellcheck="false" autocomplete="off"
+          placeholder="centrifugo-websocket.futures.open-order&#10;centrifugo-websocket.futures.margin"></textarea>
+      </label>
+      <div class="modal-actions">
+        <button id="capture-use-selected" class="ghost" title="Add the subsystems selected in the picker">Use the selected subsystems</button>
+        <button id="capture-clear-subsystems" class="ghost">Clear list</button>
+      </div>
+
+      <label class="check modal-check">
+        <input type="checkbox" id="capture-ignore-apple">
+        <span>Ignore everything from <code>com.apple</code> <em>(system noise)</em></span>
+      </label>
+      <label class="check modal-check">
+        <input type="checkbox" id="capture-ignore-nosubsystem">
+        <span>Ignore entries without a subsystem <em>(framework chatter)</em></span>
+      </label>
+
+      <p class="modal-hint" id="capture-modal-hint"></p>
+    </div>
+
+    <footer>
+      <span id="capture-modal-summary" class="muted"></span>
+      <button id="capture-modal-cancel" class="ghost">Cancel</button>
+      <button id="capture-modal-start" class="primary">Start capture</button>
+    </footer>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>
