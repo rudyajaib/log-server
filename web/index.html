@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSLog Live</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#9678;</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◎</span>
+    <div class="brand-text">
+      <h1>OSLog Live</h1>
+      <p>Unified logging from iOS simulators and devices</p>
+    </div>
+  </div>
+
+  <div class="capture">
+    <label class="field">
+      <span>Source</span>
+      <select id="target-select" aria-label="Log source"></select>
+    </label>
+    <button id="refresh-targets" class="icon-btn" title="Refresh sources" aria-label="Refresh sources">⟳</button>
+    <button id="boot-simulator" class="ghost" hidden title="Boot this simulator">Boot</button>
+    <label class="field">
+      <span>Level</span>
+      <select id="level-select" aria-label="Capture level">
+        <option value="default">Default</option>
+        <option value="info">Info</option>
+        <option value="debug">Debug</option>
+      </select>
+    </label>
+    <button id="capture-toggle" class="primary">Start capture</button>
+  </div>
+</header>
+
+<section class="statusbar">
+  <span id="status-dot" class="dot idle" aria-hidden="true"></span>
+  <span id="status-text" class="status-text">Idle</span>
+  <span class="sep"></span>
+  <span id="stat-rate" title="Entries per second">0.0/s</span>
+  <span id="stat-count" title="Entries received during this capture">0</span>
+  <span id="stat-buffer" title="Entries held in the server buffer">buffer 0</span>
+  <span id="stat-clients" title="Connected viewers">0 viewers</span>
+  <span class="spacer"></span>
+  <button id="advanced-toggle" class="link-btn">Predicate</button>
+</section>
+
+<div id="banner" class="banner" hidden>
+  <span id="banner-text"></span>
+  <button id="banner-close" class="icon-btn" aria-label="Dismiss">×</button>
+</div>
+
+<section class="filters">
+  <div class="filter-row">
+    <div class="multiselect" id="subsystem-filter"></div>
+    <div class="multiselect" id="category-filter"></div>
+    <div class="multiselect" id="process-filter"></div>
+    <div class="chips" id="level-filter" role="group" aria-label="Levels"></div>
+  </div>
+
+  <div class="filter-row">
+    <div class="search">
+      <input id="query" type="search" placeholder="Search messages, subsystems, categories, processes…   /" autocomplete="off" spellcheck="false" aria-label="Search query">
+      <button id="regex-toggle" class="toggle" title="Treat the query as a regular expression">.*</button>
+      <button id="case-toggle" class="toggle" title="Match case">Aa</button>
+    </div>
+    <label class="check"><input type="checkbox" id="require-subsystem"> hide entries without a subsystem</label>
+    <span class="spacer"></span>
+    <button id="pause-toggle" class="ghost">Pause</button>
+    <button id="autoscroll-toggle" class="ghost active">Auto-scroll</button>
+    <button id="sort-toggle" class="ghost">Newest first</button>
+    <button id="clear-view" class="ghost">Clear view</button>
+  </div>
+
+  <div class="filter-row advanced" id="advanced-row" hidden>
+    <label class="field grow">
+      <span>Base predicate — NSPredicate evaluated at the source, e.g. <code>subsystem == "com.example.app"</code> (used the next time a capture starts)</span>
+      <input id="predicate" placeholder="subsystem BEGINSWITH &quot;com.example&quot;" autocomplete="off" spellcheck="false">
+    </label>
+  </div>
+</section>
+
+<main class="logwrap">
+  <div class="log-scroll" id="log-scroll">
+    <div class="log-head" id="log-head">
+      <div class="col">Time</div>
+      <div class="col">Level</div>
+      <div class="col">Process</div>
+      <div class="col">Subsystem</div>
+      <div class="col">Category</div>
+      <div class="col">Message</div>
+    </div>
+    <div id="log-rows" class="log-rows" role="log" aria-live="off"></div>
+  </div>
+  <div id="empty-state" class="empty-state">
+    <p class="empty-title">No log entries</p>
+    <p class="empty-sub">Choose a source above and press <strong>Start capture</strong>.</p>
+  </div>
+  <button id="jump-latest" class="jump" hidden>Jump to latest ↓</button>
+</main>
+
+<footer class="bottombar">
+  <div class="counts">
+    <span id="visible-count">0 shown</span>
+    <span id="match-count" class="muted"></span>
+    <span id="drop-note" class="warn" hidden></span>
+  </div>
+  <div class="exports">
+    <span class="muted">Export filtered:</span>
+    <button data-format="json" title="JSON envelope with metadata">JSON</button>
+    <button data-format="csv" title="Spreadsheet friendly">CSV</button>
+    <button data-format="ndjson" title="One JSON object per line">NDJSON</button>
+    <button data-format="txt" title="Plain text log lines">TXT</button>
+    <button id="copy-json" class="ghost" title="Copy the entries currently loaded in the browser">Copy loaded</button>
+    <button id="copy-link" class="ghost" title="Copy a link that reproduces this filtered view">Copy link</button>
+  </div>
+</footer>
+
+<aside id="detail" class="detail" hidden aria-label="Entry details">
+  <header>
+    <h2>Entry</h2>
+    <div class="detail-actions">
+      <button id="detail-copy" class="ghost">Copy JSON</button>
+      <button id="detail-close" class="icon-btn" aria-label="Close">×</button>
+    </div>
+  </header>
+  <pre id="detail-body"></pre>
+</aside>
+
+<script src="app.js"></script>
+</body>
+</html>
